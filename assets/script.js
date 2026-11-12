@@ -754,8 +754,13 @@ function renderDbProducts(dbProducts, container) {
             </div>
         `;
 
+        // Dữ liệu phục vụ bộ lọc & sắp xếp chuẩn xác
+        const priceSaleRaw = (typeof product.price_sale_raw !== 'undefined') ? product.price_sale_raw : parsePrice(product.price_sale);
+        const hasDiscount = Boolean((product.discount && product.discount.trim() !== '') || (product.price_original_raw > product.price_sale_raw));
+        const hasGift = Boolean(product.gift && product.gift.trim() !== '');
+
         const itemHTML = `
-            <div class="product-card" data-category="${product.category || ''}" data-db-id="${product.id}" data-detail-url="${appUrl('/client/product.php')}?id=${encodeURIComponent(product.id)}" role="link" tabindex="0" aria-label="Xem chi tiết sản phẩm">
+            <div class="product-card" data-category="${product.category || ''}" data-db-id="${product.id}" data-price="${priceSaleRaw}" data-stock="${stock}" data-discount="${hasDiscount ? '1' : '0'}" data-gift="${hasGift ? '1' : '0'}" data-sold="${soldCount}" data-detail-url="${appUrl('/client/product.php')}?id=${encodeURIComponent(product.id)}" role="link" tabindex="0" aria-label="Xem chi tiết sản phẩm">
                 ${badgeHTML}
                 <button class="wishlist-btn" title="Yêu thích">♡</button>
                 <img src="${getProductImageUrl(product.image)}" alt="${product.name}" class="product-image" onerror="this.src='${appUrl('/assets/banner/logo.png')}';">
@@ -1374,190 +1379,327 @@ function initStickyHeader() {
     }
 }
 
-// ==================== CATEGORY FILTERS & SORTING ====================
+// ==================== CATEGORY FILTERS & SORTING (SHOPEE STYLE) ====================
+// Tác dụng: Quản lý logic lọc sản phẩm đa tiêu chí và sắp xếp phía Client không reload trang theo phong cách Shopee
 function initCategoryFilters() {
     const productGrid = document.querySelector('.category-grid');
     if (!productGrid) return;
 
-    const filterBtn = document.querySelector('.apply-filter-btn');
-    const sortSelect = document.querySelector('.sorting-options select');
+    // Các phần tử lọc giá
+    const priceFromInput = document.getElementById('filter-price-from') || document.querySelectorAll('.price-filter input')[0];
+    const priceToInput = document.getElementById('filter-price-to') || document.querySelectorAll('.price-filter input')[1];
+    const applyBtn = document.getElementById('btn-apply-filter') || document.querySelector('.apply-filter-btn');
+    const resetBtn = document.getElementById('btn-reset-all-filters');
+    const priceChips = document.querySelectorAll('.price-chip');
 
-    // Lấy input an toàn hơn
-    const priceInputs = document.querySelectorAll('.price-filter input');
-    const priceFrom = priceInputs.length > 0 ? priceInputs[0] : null;
-    const priceTo = priceInputs.length > 1 ? priceInputs[1] : null;
+    // Các checkbox tình trạng & ưu đãi
+    const inStockCb = document.getElementById('filter-in-stock');
+    const discountCb = document.getElementById('filter-has-discount');
+    const giftCb = document.getElementById('filter-has-gift');
 
-    // Lọc checkboxes động dựa theo tiêu đề nhóm lọc để tránh lỗi thứ tự thẻ (nth-of-type)
-    let brandCheckboxes = [];
-    let typeCheckboxes = [];
+    // Thanh tag tiêu chí đang lọc & nút xóa tất cả
+    const activeFilterBar = document.getElementById('active-filter-bar');
+    const activeFilterTagsList = document.getElementById('active-filter-tags-list');
+    const clearTagsBtn = document.getElementById('btn-clear-tags');
 
-    document.querySelectorAll('.filter-group').forEach(group => {
-        const groupTitleEl = group.querySelector('h3');
-        if (!groupTitleEl) return;
-        const titleText = groupTitleEl.textContent.trim().toUpperCase();
+    // Khối rỗng khi không có kết quả
+    const emptyState = document.getElementById('filter-empty-state');
+    const emptyResetBtn = document.getElementById('btn-empty-reset');
 
-        if (titleText.includes('THƯƠNG HIỆU')) {
-            brandCheckboxes = Array.from(group.querySelectorAll('input[type="checkbox"]'));
-        } else if (titleText.includes('LOẠI SẢN PHẨM') || titleText.includes('LOẠI SON') || titleText.includes('LOẠI DA')) {
-            typeCheckboxes = Array.from(group.querySelectorAll('input[type="checkbox"]'));
+    // Thanh sắp xếp Shopee
+    const sortBtns = document.querySelectorAll('.shopee-sort-btn[data-sort]');
+    const priceDropdown = document.getElementById('shopee-sort-price-dropdown');
+    const priceDropdownToggle = document.getElementById('price-dropdown-toggle');
+    const priceDropdownLabel = priceDropdownToggle?.querySelector('.price-dropdown-label');
+    const priceDropdownItems = document.querySelectorAll('.price-dropdown-item');
+    const legacySortSelect = document.querySelector('.sorting-options select') || document.getElementById('product-sort');
+
+    let currentSort = 'popular'; // 'popular' | 'newest' | 'best_selling' | 'price_asc' | 'price_desc'
+
+    // Hàm tiện ích: Làm sạch và chuẩn hóa số tiền từ chuỗi
+    function parseVndNumber(val) {
+        if (!val) return null;
+        const cleaned = String(val).replace(/[^\d]/g, '');
+        if (!cleaned) return null;
+        let num = parseInt(cleaned, 10);
+        return isNaN(num) ? null : num;
+    }
+
+    // Hàm tiện ích: Định dạng số tiền kiểu VNĐ (ví dụ 500000 -> 500.000)
+    function formatVndNumber(num) {
+        if (num === null || num === undefined || isNaN(num)) return '';
+        return Number(num).toLocaleString('vi-VN');
+    }
+
+    // Tự động định dạng số tiền khi người dùng gõ vào ô nhập giá
+    function bindInputFormatter(input) {
+        if (!input) return;
+        input.addEventListener('input', () => {
+            const raw = parseVndNumber(input.value);
+            input.value = raw !== null ? formatVndNumber(raw) : '';
+            // Bỏ kích hoạt chips khi gõ tay tự do
+            priceChips.forEach(chip => chip.classList.remove('active'));
+        });
+    }
+    bindInputFormatter(priceFromInput);
+    bindInputFormatter(priceToInput);
+
+    // Xử lý click chọn nhanh khoảng giá dạng Chips/Pills
+    priceChips.forEach(chip => {
+        chip.addEventListener('click', () => {
+            const wasActive = chip.classList.contains('active');
+            priceChips.forEach(c => c.classList.remove('active'));
+
+            if (wasActive) {
+                if (priceFromInput) priceFromInput.value = '';
+                if (priceToInput) priceToInput.value = '';
+            } else {
+                chip.classList.add('active');
+                const minVal = chip.getAttribute('data-min');
+                const maxVal = chip.getAttribute('data-max');
+
+                if (priceFromInput) {
+                    priceFromInput.value = minVal && minVal !== '0' ? formatVndNumber(minVal) : (minVal === '0' ? '0' : '');
+                }
+                if (priceToInput) {
+                    priceToInput.value = maxVal ? formatVndNumber(maxVal) : '';
+                }
+            }
+            applyFilters();
+        });
+    });
+
+    // Lắng nghe thay đổi các checkbox ưu đãi & tình trạng kho
+    [inStockCb, discountCb, giftCb].forEach(cb => {
+        if (cb) {
+            cb.addEventListener('change', applyFilters);
         }
     });
 
-    function parsePriceValue(priceStr) {
-        if (!priceStr) return 0;
-        return Number(priceStr.replace(/[^\d]/g, '')) || 0;
+    // Nút Áp dụng khoảng giá
+    if (applyBtn) {
+        applyBtn.addEventListener('click', applyFilters);
     }
 
-    function parseSoldValue(text) {
-        if (!text) return 0;
-        let num = parseFloat(text.replace(/[^\d.]/g, '')) || 0;
-        if (text.toLowerCase().includes('k')) num *= 1000;
-        return num;
+    // Đưa toàn bộ bộ lọc về trạng thái ban đầu
+    function resetAllFilters() {
+        if (priceFromInput) priceFromInput.value = '';
+        if (priceToInput) priceToInput.value = '';
+        priceChips.forEach(c => c.classList.remove('active'));
+        if (inStockCb) inStockCb.checked = false;
+        if (discountCb) discountCb.checked = false;
+        if (giftCb) giftCb.checked = false;
+        applyFilters();
     }
 
-    function parseVietnamesePriceInput(valStr) {
-        if (!valStr) return 0;
-        let cleaned = valStr.replace(/[\.\,\s]/g, '');
-        let num = Number(cleaned);
-        if (isNaN(num)) return 0;
-        // Nếu người dùng nhập 99 hoặc 500 thì tự động nhân 1000 thành 99k, 500k
-        if (num > 0 && num < 10000) {
-            num *= 1000;
-        }
-        return num;
-    }
+    if (resetBtn) resetBtn.addEventListener('click', resetAllFilters);
+    if (clearTagsBtn) clearTagsBtn.addEventListener('click', resetAllFilters);
+    if (emptyResetBtn) emptyResetBtn.addEventListener('click', resetAllFilters);
 
-    function applyFilters() {
-        const activeBrands = brandCheckboxes
-            .filter(function (cb) { return cb.checked; })
-            .map(function (cb) { return cb.closest('label').textContent.trim().toLowerCase(); });
+    // ================= SẮP XẾP PHONG CÁCH SHOPEE =================
+    sortBtns.forEach(btn => {
+        btn.addEventListener('click', () => {
+            sortBtns.forEach(b => b.classList.remove('active'));
+            priceDropdownToggle?.classList.remove('active');
+            if (priceDropdownLabel) priceDropdownLabel.textContent = 'Giá';
+            priceDropdownItems.forEach(i => i.classList.remove('active'));
 
-        const activeTypeCheckboxes = typeCheckboxes.filter(function (cb) { return cb.checked; });
+            btn.classList.add('active');
+            currentSort = btn.getAttribute('data-sort') || 'popular';
+            applySorting();
+        });
+    });
 
-        let minPrice = 0;
-        if (priceFrom && priceFrom.value.trim() !== "") {
-            minPrice = parseVietnamesePriceInput(priceFrom.value);
-        }
+    // Toggle dropdown giá
+    if (priceDropdownToggle && priceDropdown) {
+        priceDropdownToggle.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const isOpen = priceDropdown.classList.toggle('open');
+            priceDropdownToggle.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
+        });
 
-        let maxPrice = Infinity;
-        if (priceTo && priceTo.value.trim() !== "") {
-            maxPrice = parseVietnamesePriceInput(priceTo.value);
-        }
-
-        const hasActiveFilters = activeBrands.length > 0 ||
-            activeTypeCheckboxes.length > 0 ||
-            (priceFrom && priceFrom.value.trim() !== "") ||
-            (priceTo && priceTo.value.trim() !== "");
-
-        const loadMoreContainer = document.querySelector('.load-more-container');
-        const loadMoreBtn = document.getElementById('load-more-btn');
-
-        if (loadMoreContainer) {
-            loadMoreContainer.style.display = hasActiveFilters ? 'none' : 'block';
-            if (loadMoreBtn && !hasActiveFilters) {
-                loadMoreBtn.textContent = 'Xem thêm';
+        document.addEventListener('click', (e) => {
+            if (!priceDropdown.contains(e.target)) {
+                priceDropdown.classList.remove('open');
+                priceDropdownToggle.setAttribute('aria-expanded', 'false');
             }
-        }
+        });
+    }
 
-        const currentProducts = Array.from(productGrid.querySelectorAll('.product-card'));
-        currentProducts.forEach(function (card) {
-            const brandEl = card.querySelector('.product-brand');
-            const titleEl = card.querySelector('h3');
-            const priceEl = card.querySelector('.price-sale');
+    // Chọn kiểu sắp xếp giá trong dropdown
+    priceDropdownItems.forEach(item => {
+        item.addEventListener('click', () => {
+            sortBtns.forEach(b => b.classList.remove('active'));
+            priceDropdownToggle?.classList.add('active');
+            if (priceDropdownLabel) {
+                priceDropdownLabel.textContent = item.textContent.trim();
+            }
+            priceDropdownItems.forEach(i => i.classList.remove('active'));
+            item.classList.add('active');
 
-            const brand = brandEl ? brandEl.textContent.trim().toLowerCase() : '';
-            const title = titleEl ? titleEl.textContent.trim().toLowerCase() : '';
-            const price = priceEl ? parsePriceValue(priceEl.textContent) : 0;
-            const cardCategory = card.getAttribute('data-category') || '';
+            currentSort = item.getAttribute('data-sort') || 'price_asc';
+            priceDropdown?.classList.remove('open');
+            priceDropdownToggle?.setAttribute('aria-expanded', 'false');
+            applySorting();
+        });
+    });
 
-            if (hasActiveFilters) {
-                let showBrand = activeBrands.length === 0 || activeBrands.includes(brand);
+    // Hỗ trợ thẻ select sắp xếp cũ (nếu có trên trang khác)
+    if (legacySortSelect) {
+        legacySortSelect.addEventListener('change', () => {
+            const val = legacySortSelect.value;
+            if (val === 'Giá từ thấp đến cao') currentSort = 'price_asc';
+            else if (val === 'Giá từ cao đến thấp') currentSort = 'price_desc';
+            else if (val === 'Bán chạy nhất') currentSort = 'best_selling';
+            else if (val === 'Mới cập nhật') currentSort = 'newest';
+            else currentSort = 'popular';
+            applySorting();
+        });
+    }
 
-                let showType = activeTypeCheckboxes.length === 0;
-                if (!showType) {
-                    showType = activeTypeCheckboxes.some(function (cb) {
-                        const typeText = cb.closest('label').textContent.trim().toLowerCase();
-                        const typeValue = cb.value;
+    // ================= HÀM LỌC SẢN PHẨM (APPLY FILTERS) =================
+    function applyFilters() {
+        const minVal = parseVndNumber(priceFromInput?.value);
+        const maxVal = parseVndNumber(priceToInput?.value);
+        const reqInStock = inStockCb ? inStockCb.checked : false;
+        const reqDiscount = discountCb ? discountCb.checked : false;
+        const reqGift = giftCb ? giftCb.checked : false;
 
-                        // 1. Nếu checkbox có thuộc tính value cụ thể (như sua-rua-mat, phan-nuoc,...)
-                        if (typeValue && typeValue !== 'on') {
-                            if (cardCategory === typeValue) return true;
-                        }
+        const allCards = Array.from(productGrid.querySelectorAll('.product-card'));
+        let matchCount = 0;
 
-                        // 2. Dự phòng so khớp theo tên sản phẩm
-                        if (typeText.includes('lì') && (title.includes('lì') || title.includes('kem min') || title.includes('kem mịn'))) return true;
-                        if (typeText.includes('tint') && (title.includes('tint') || title.includes('bóng'))) return true;
+        allCards.forEach(card => {
+            const cardPrice = Number(card.getAttribute('data-price')) || parsePrice(card.querySelector('.price-sale')?.textContent) || 0;
+            const cardStock = card.hasAttribute('data-stock')
+                ? parseInt(card.getAttribute('data-stock'), 10)
+                : (card.querySelector('.product-stock')?.textContent.includes('Hết hàng') ? 0 : 10);
 
-                        return false;
-                    });
-                }
+            const cardDiscount = card.getAttribute('data-discount') === '1'
+                || Boolean(card.querySelector('.product-badge'))
+                || Boolean(card.querySelector('.price-original'));
 
-                let showPrice = price >= minPrice && price <= maxPrice;
+            const cardGift = card.getAttribute('data-gift') === '1'
+                || Boolean(card.querySelector('.product-gift'));
 
-                if (showBrand && showType && showPrice) {
-                    card.style.display = '';
-                } else {
-                    card.style.display = 'none';
-                }
+            let passPrice = true;
+            if (minVal !== null && cardPrice < minVal) passPrice = false;
+            if (maxVal !== null && cardPrice > maxVal) passPrice = false;
+
+            let passStock = !reqInStock || (cardStock > 0);
+            let passDiscount = !reqDiscount || cardDiscount;
+            let passGift = !reqGift || cardGift;
+
+            if (passPrice && passStock && passDiscount && passGift) {
+                card.style.display = '';
+                matchCount++;
             } else {
-                // Không có bộ lọc nào kích hoạt: phục hồi trạng thái phân trang mặc định (hiện 6, ẩn extra)
-                if (card.classList.contains('extra-product')) {
-                    card.style.display = 'none';
-                } else {
-                    card.style.display = '';
-                }
+                card.style.display = 'none';
             }
         });
 
+        // Ẩn/Hiện khối Empty State
+        if (emptyState) {
+            emptyState.style.display = (matchCount === 0) ? 'block' : 'none';
+        }
+
+        // Vẽ lại thanh tags tiêu chí đang lọc độc lập (không dính chữ)
+        renderActiveFilterBadges(minVal, maxVal, reqInStock, reqDiscount, reqGift);
+
+        // Áp dụng sắp xếp lại cho các sản phẩm đang hiển thị
         applySorting();
     }
 
+    // ================= VẼ CÁC PILL BADGES TIÊU CHÍ ĐANG LỌC =================
+    // Tác dụng: Khắc phục triệt để lỗi dính chữ, mỗi tiêu chí là một tag riêng biệt có nút (×) để xóa từng điều kiện
+    function renderActiveFilterBadges(minVal, maxVal, reqInStock, reqDiscount, reqGift) {
+        if (!activeFilterBar || !activeFilterTagsList) return;
+
+        const badges = [];
+
+        if (minVal !== null && maxVal !== null) {
+            badges.push({ type: 'price', label: `${formatVndNumber(minVal)}₫ - ${formatVndNumber(maxVal)}₫` });
+        } else if (minVal !== null) {
+            badges.push({ type: 'price', label: `Từ ${formatVndNumber(minVal)}₫` });
+        } else if (maxVal !== null) {
+            badges.push({ type: 'price', label: `Đến ${formatVndNumber(maxVal)}₫` });
+        }
+
+        if (reqInStock) {
+            badges.push({ type: 'stock', label: 'Còn hàng' });
+        }
+        if (reqDiscount) {
+            badges.push({ type: 'discount', label: 'Đang giảm giá' });
+        }
+        if (reqGift) {
+            badges.push({ type: 'gift', label: 'Có quà tặng' });
+        }
+
+        if (badges.length === 0) {
+            activeFilterBar.style.display = 'none';
+            activeFilterTagsList.innerHTML = '';
+            return;
+        }
+
+        activeFilterBar.style.display = 'flex';
+        activeFilterTagsList.innerHTML = badges.map(b => `
+            <span class="filter-pill-badge" data-badge-type="${b.type}">
+                <span>${b.label}</span>
+                <button type="button" class="pill-remove-btn" data-remove="${b.type}" title="Xóa bộ lọc này">×</button>
+            </span>
+        `).join('');
+
+        // Bắt sự kiện xóa lẻ từng tag điều kiện
+        activeFilterTagsList.querySelectorAll('.pill-remove-btn').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const removeType = btn.getAttribute('data-remove');
+                if (removeType === 'price') {
+                    if (priceFromInput) priceFromInput.value = '';
+                    if (priceToInput) priceToInput.value = '';
+                    priceChips.forEach(c => c.classList.remove('active'));
+                } else if (removeType === 'stock') {
+                    if (inStockCb) inStockCb.checked = false;
+                } else if (removeType === 'discount') {
+                    if (discountCb) discountCb.checked = false;
+                } else if (removeType === 'gift') {
+                    if (giftCb) giftCb.checked = false;
+                }
+                applyFilters();
+            });
+        });
+    }
+
+    // ================= SẮP XẾP SẢN PHẨM THEO TIÊU CHÍ =================
     function applySorting() {
-        if (!sortSelect) return;
-        const sortType = sortSelect.value;
         const visibleProducts = Array.from(productGrid.querySelectorAll('.product-card'));
+        if (visibleProducts.length <= 1) return;
 
-        visibleProducts.sort(function (a, b) {
-            const priceElA = a.querySelector('.price-sale');
-            const priceElB = b.querySelector('.price-sale');
-            const priceA = priceElA ? parsePriceValue(priceElA.textContent) : 0;
-            const priceB = priceElB ? parsePriceValue(priceElB.textContent) : 0;
+        visibleProducts.sort((a, b) => {
+            const priceA = Number(a.getAttribute('data-price')) || parsePrice(a.querySelector('.price-sale')?.textContent) || 0;
+            const priceB = Number(b.getAttribute('data-price')) || parsePrice(b.querySelector('.price-sale')?.textContent) || 0;
+            const soldA = Number(a.getAttribute('data-sold')) || 0;
+            const soldB = Number(b.getAttribute('data-sold')) || 0;
+            const idA = Number(a.getAttribute('data-db-id')) || 0;
+            const idB = Number(b.getAttribute('data-db-id')) || 0;
 
-            const soldElA = a.querySelector('.sold');
-            const soldElB = b.querySelector('.sold');
-            const soldA = soldElA ? parseSoldValue(soldElA.textContent) : 0;
-            const soldB = soldElB ? parseSoldValue(soldElB.textContent) : 0;
+            if (currentSort === 'price_asc') return priceA - priceB;
+            if (currentSort === 'price_desc') return priceB - priceA;
+            if (currentSort === 'newest') return idB - idA;
+            if (currentSort === 'best_selling') return soldB - soldA;
 
-            if (sortType === 'Giá từ thấp đến cao') return priceA - priceB;
-            if (sortType === 'Giá từ cao đến thấp') return priceB - priceA;
-            if (sortType === 'Bán chạy nhất') return soldB - soldA;
-
-            return 0;
+            // 'popular' (mặc định): ưu tiên sản phẩm bán chạy, sau đó tới mới nhất
+            if (soldB !== soldA) return soldB - soldA;
+            return idB - idA;
         });
 
-        visibleProducts.forEach(function (card) {
+        visibleProducts.forEach(card => {
             productGrid.appendChild(card);
         });
     }
 
-    // Gắn sự kiện Lọc/Sắp xếp
-    if (filterBtn) {
-        filterBtn.addEventListener('click', applyFilters);
-    }
-    brandCheckboxes.forEach(function (cb) {
-        cb.addEventListener('change', applyFilters);
-    });
-    typeCheckboxes.forEach(function (cb) {
-        cb.addEventListener('change', applyFilters);
-    });
-    if (sortSelect) {
-        sortSelect.addEventListener('change', applySorting);
-    }
-
-    // Quản lý nút "Xem thêm" toàn cục (Global Load More)
+    // Quản lý nút "Xem thêm" toàn cục (nếu có)
     const loadMoreBtn = document.getElementById('load-more-btn');
     if (loadMoreBtn) {
-        // Thay thế hoặc gắn trực tiếp sự kiện (đã an toàn nhờ DOMContentLoaded chạy 1 lần duy nhất)
         loadMoreBtn.addEventListener('click', function () {
             const extraProducts = document.querySelectorAll('.extra-product');
             if (extraProducts.length === 0) return;
